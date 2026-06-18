@@ -1,0 +1,132 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Write stats about this node to stdout
+#
+#
+
+use POSIX;
+use strict;
+use File::Slurp;
+use JSON::XS;
+use Filesys::Df;
+use Solr;
+use Data::Dumper;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options("%c %o",
+				    ['output|o=s' => "output file"],
+				    ['dir|d=s' => "output directory; write to file named with hostname"],
+				    ['help|h' => 'show this help message']);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 0;
+
+my $data = {};
+chomp($data->{hostname} = `hostname`);
+
+#
+# System uptime, in seconds
+#
+open(F, "<", "/proc/uptime") or die "Cannot open /proc/uptime: $!";
+my $l = <F>;
+my($uptime) = $l =~ /^(\S+)/;
+close(F);
+$data->{uptime} = $uptime;
+
+#
+# Solr disk space
+#
+my @fs;
+open(F, "<", "/proc/mounts") or die "Cannot open /proc/mounts; $!";
+while (<F>)
+{
+    my($dev, $mount, $type, $opts) = split(/\s+/);
+    if ($mount =~ m,^/solr-data, || $mount eq '/solr')
+    {
+	my $df = df($mount, 1e9);
+	my $fsrec = {
+	    mount => $mount,
+	    total => $df->{blocks},
+	    used => $df->{used},
+	    available => $df->{bavail},
+	    pct => $df->{per},
+	};
+	push(@fs, $fsrec);
+    }
+}
+close(F);
+$data->{filesystems} = [sort { $a->{mount} cmp $b->{mount} } @fs];
+
+open(L, "<", "/proc/loadavg") or die "Cannot open /proc/loadavg: $!";
+my(@l) = split(/\s+/, scalar <L>);
+$data->{loadavg} = \@l;
+
+#
+# CPU info
+#
+# Switch this to use lscpu -J to get core/thread info
+#
+my $cpu = {};
+$data->{cpu} = $cpu;
+open(F, "<", "/proc/cpuinfo") or die "Cannot open /proc/cpuinfo: $!";
+my %km = ('model name' => 'model');
+
+while (<F>)
+{
+    last if /^\s+/;
+    my($k, $v) = /^([^:]+?)\s+:\s+(.*)/;
+    if (my $mk = $km{$k})
+    {
+	$cpu->{$mk} = $v;
+    }
+}
+chomp($cpu->{cores} = `nproc`);
+
+#
+# Memory
+#
+my $mem = {};
+$data->{memory} = $mem;
+open(F, "<", "/proc/meminfo") or die "Cannot open /proc/cpuinfo: $!";
+my %km = ('MemTotal' => 'total',
+	  'MemFree' => 'free',
+	  'MemAvailable' => 'available');
+
+while (<F>)
+{
+    last if /^\s+/;
+    my($k, $v) = /^([^:]+?)\s*:\s*(.*)/;
+    if (my $mk = $km{$k})
+    {
+	if ($v =~ s/ kB$//)
+	{
+	    $v = $v / (1024 * 1000);
+	}
+	$mem->{$mk} = int($v + 0.5);
+	
+    }
+}
+
+$data->{timestamp} = time;
+
+my $path = $opt->output;
+if (!$path)
+{
+    $path = $opt->dir;
+    if ($path)
+    {
+	$path = "$path/$data->{hostname}";
+    }
+}
+
+if ($path)
+{
+    write_file($path, $json->encode($data));
+}
+else
+{
+    print $json->encode($data);
+}

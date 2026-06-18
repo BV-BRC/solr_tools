@@ -1,0 +1,298 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# For every shard that lacks an NRT replica, promote one of its TLOG replicas:
+#   1. Create a new NRT replica on the same node as the chosen TLOG
+#   2. Wait for recovery to complete
+#   3. Delete the TLOG replica
+#
+# TLOG candidates are chosen to keep NRT replicas as evenly distributed
+# across nodes as possible.
+#
+# Usage:
+#   st-fix-nrt-replicas [options]
+#
+
+use strict;
+use POSIX qw(strftime);
+use JSON::XS;
+use Solr;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options(
+    "%c %o",
+    ['url=s'           => 'Solr base url', { default => 'https://bio-gp1.cels.anl.gov:15183/solr' }],
+    ['netrc=s'         => 'netrc file for passwords'],
+    ['concurrency|c=i' => 'Max simultaneous promotions in flight', { default => 2 }],
+    ['dry-run|n'       => 'Print plan without submitting requests'],
+    ['help|h'          => 'show this help message'],
+);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 0;
+
+my $creds;
+$creds = { netrc => $opt->netrc } if $opt->netrc;
+
+my($solr, $status) = get_cluster_status_any($opt->url, $creds);
+
+sub get_cluster_status_any {
+    my($primary_url, $creds) = @_;
+    my $solr   = Solr->new($primary_url, $creds);
+    my $status = eval { $solr->get_cluster_status() };
+    return ($solr, $status) unless $@;
+
+    warn "Could not reach $primary_url: $@Trying live local cluster nodes...\n";
+    for my $node (grep { $_->{pid_status} eq 'live' && !$_->{stopped} } Solr->cluster_nodes()) {
+        $solr   = Solr->new($node->{url}, $creds);
+        $status = eval { $solr->get_cluster_status() };
+        unless ($@) {
+            printf "Using node: %s\n", $node->{url};
+            return ($solr, $status);
+        }
+    }
+    die "Could not retrieve cluster status from $primary_url or any live local node\n";
+}
+
+# Count existing NRT replicas per node across the entire cluster.
+# This seeds the load-balancing so new NRTs spread as evenly as possible.
+my %nrt_count;
+for my $col_name (keys %{$status->{collections}}) {
+    for my $shard_name (keys %{$status->{collections}{$col_name}{shards}}) {
+        for my $rep (values %{$status->{collections}{$col_name}{shards}{$shard_name}{replicas}}) {
+            $nrt_count{$rep->{node_name}} += 0;   # ensure node appears in the map
+            $nrt_count{$rep->{node_name}}++ if uc($rep->{type} // '') eq 'NRT';
+        }
+    }
+}
+
+# Build task list: one entry per shard missing an NRT replica.
+my @tasks;
+for my $col_name (sort keys %{$status->{collections}}) {
+    my $shards = $status->{collections}{$col_name}{shards};
+    for my $shard_name (sort keys %$shards) {
+        my $replicas = $shards->{$shard_name}{replicas};
+        my @reps     = values %$replicas;
+
+        next if grep { uc($_->{type} // '') eq 'NRT' } @reps;
+
+        my @tlog_reps = grep { uc($_->{type} // '') eq 'TLOG' } @reps;
+        unless (@tlog_reps) {
+            warn "WARNING: $col_name/$shard_name has no NRT and no TLOG replicas — skipping\n";
+            next;
+        }
+
+        # Among TLOG replicas, pick the one on the node with the fewest NRT replicas.
+        my ($best_tlog) = sort {
+            ($nrt_count{$a->{node_name}} // 0) <=> ($nrt_count{$b->{node_name}} // 0)
+            || $a->{node_name} cmp $b->{node_name}
+        } @tlog_reps;
+
+        # Resolve the replica name for the chosen TLOG (needed for deletion later).
+        my ($tlog_rep_name) = grep {
+            $replicas->{$_}{node_name} eq $best_tlog->{node_name}
+            && uc($replicas->{$_}{type} // '') eq 'TLOG'
+        } keys %$replicas;
+
+        my $nrt_before = $nrt_count{$best_tlog->{node_name}} // 0;
+        $nrt_count{$best_tlog->{node_name}}++;  # reserve slot for planning balance
+
+        push @tasks, {
+            collection    => $col_name,
+            shard         => $shard_name,
+            target_node   => $best_tlog->{node_name},
+            tlog_rep_name => $tlog_rep_name,
+            nrt_before    => $nrt_before,
+        };
+    }
+}
+
+if (!@tasks) {
+    print "All shards already have NRT replicas. Nothing to do.\n";
+    exit 0;
+}
+
+# Print NRT distribution summary
+print "Current NRT replica distribution:\n";
+printf "  %-45s  %d\n", $_, $nrt_count{$_} - (grep { $_->{target_node} eq $_ } @tasks)
+    for sort keys %nrt_count;
+print "\n";
+
+printf "Plan: %d shard(s) to promote TLOG -> NRT\n\n", scalar @tasks;
+printf "  %-40s  %-45s  %-18s  %s\n",
+    "COLLECTION/SHARD", "TARGET NODE", "TLOG TO DELETE", "NRT COUNT (before->after)";
+for my $t (@tasks) {
+    printf "  %-40s  %-45s  %-18s  %d -> %d\n",
+        "$t->{collection}/$t->{shard}",
+        $t->{target_node},
+        $t->{tlog_rep_name},
+        $t->{nrt_before},
+        $t->{nrt_before} + 1;
+}
+print "\n";
+
+exit 0 if $opt->dry_run;
+
+printf "Concurrency: %d\n\n", $opt->concurrency;
+
+my $ts      = strftime("%Y%m%d-%H%M%S", localtime);
+my $seq     = 0;
+my @queue   = @tasks;
+my @pending = ();
+
+# Task phases:
+#   add_async    - ADDREPLICA (NRT) submitted, polling REQUESTSTATUS
+#   recovering   - async done, NRT exists but not yet active
+#   delete_async - NRT active, DELETEREPLICA (TLOG) submitted, polling REQUESTSTATUS
+#
+# A concurrency slot is held across all three phases so --concurrency truly
+# limits how many simultaneous index recoveries are in progress.
+
+sub find_nrt_rep_name {
+    my($cs, $t) = @_;
+    my $replicas = $cs->{collections}{$t->{collection}}{shards}{$t->{shard}}{replicas} // {};
+    my ($name) = grep {
+        $replicas->{$_}{node_name} eq $t->{target_node}
+        && uc($replicas->{$_}{type} // '') eq 'NRT'
+    } keys %$replicas;
+    return $name;
+}
+
+sub submit_add {
+    my $t   = shift @queue;
+    my $key = "nrt-add-$ts-" . $seq++;
+
+    my $url = $opt->url
+            . "/admin/collections?action=ADDREPLICA"
+            . "&collection=$t->{collection}"
+            . "&shard=$t->{shard}"
+            . "&type=NRT"
+            . "&node=$t->{target_node}"
+            . "&async=$key";
+
+    printf "Adding NRT (%d queued) %s/%s on %s ... ",
+        scalar @queue, $t->{collection}, $t->{shard}, $t->{target_node};
+    my $res = $solr->ua->get($url);
+    if (!$res->is_success) {
+        printf "HTTP %s FAILED\n", $res->code;
+        warn $res->content . "\n";
+        return;
+    }
+    my $dat = $json->decode($res->content);
+    if ($dat->{responseHeader}{status} != 0) {
+        print "FAILED\n";
+        warn $json->encode($dat) . "\n";
+        return;
+    }
+    print "ok (key=$key)\n";
+    push @pending, { phase => 'add_async', key => $key, task => $t };
+}
+
+submit_add() while @queue && @pending < $opt->concurrency;
+
+while (@pending) {
+    sleep 10;
+
+    my $need_cs = grep { $_->{phase} eq 'recovering' } @pending;
+    my $cs = $need_cs ? $solr->get_cluster_status() : undef;
+
+    my @still;
+    for my $p (@pending) {
+        my $t = $p->{task};
+
+        if ($p->{phase} eq 'add_async') {
+            my $url = $opt->url . "/admin/collections?action=REQUESTSTATUS&requestid=$p->{key}";
+            my $res = $solr->ua->get($url);
+            if (!$res->is_success) {
+                warn "Status check failed for $p->{key}: " . $res->content . "\n";
+                push @still, $p;
+                next;
+            }
+            my $dat   = $json->decode($res->content);
+            my $state = $dat->{status}{state} // '';
+            if ($state eq 'running' || $state eq 'submitted') {
+                push @still, $p;
+            } elsif ($state eq 'completed') {
+                printf "  [nrt created ] %s/%s on %s (recovering)\n",
+                    $t->{collection}, $t->{shard}, $t->{target_node};
+                $p->{phase} = 'recovering';
+                $cs //= $solr->get_cluster_status();
+                push @still, $p;
+            } else {
+                printf "  [%-12s] %s/%s add NRT\n", $state, $t->{collection}, $t->{shard};
+                # slot freed on failure
+            }
+
+        } elsif ($p->{phase} eq 'recovering') {
+            $cs //= $solr->get_cluster_status();
+            my $nrt_name = find_nrt_rep_name($cs, $t);
+            if (!$nrt_name) {
+                warn "  [missing     ] NRT replica for $t->{collection}/$t->{shard} on $t->{target_node}\n";
+                push @still, $p;
+                next;
+            }
+            my $rep_state = $cs->{collections}{$t->{collection}}{shards}{$t->{shard}}{replicas}{$nrt_name}{state};
+            if ($rep_state eq 'active') {
+                printf "  [nrt active  ] %s/%s — submitting delete of TLOG %s\n",
+                    $t->{collection}, $t->{shard}, $t->{tlog_rep_name};
+                my $key = "nrt-del-$ts-" . $seq++;
+                my $url = $opt->url
+                        . "/admin/collections?action=DELETEREPLICA"
+                        . "&collection=$t->{collection}"
+                        . "&shard=$t->{shard}"
+                        . "&replica=$t->{tlog_rep_name}"
+                        . "&async=$key";
+                my $res = $solr->ua->get($url);
+                if (!$res->is_success) {
+                    warn "  DELETEREPLICA HTTP " . $res->code . " for $t->{tlog_rep_name}: " . $res->content . "\n";
+                    # slot freed — don't push to @still
+                } else {
+                    my $dat = $json->decode($res->content);
+                    if ($dat->{responseHeader}{status} != 0) {
+                        warn "  DELETEREPLICA error for $t->{tlog_rep_name}: " . $json->encode($dat) . "\n";
+                        # slot freed
+                    } else {
+                        $p->{phase} = 'delete_async';
+                        $p->{key}   = $key;
+                        push @still, $p;
+                    }
+                }
+            } else {
+                push @still, $p;
+            }
+
+        } elsif ($p->{phase} eq 'delete_async') {
+            my $url = $opt->url . "/admin/collections?action=REQUESTSTATUS&requestid=$p->{key}";
+            my $res = $solr->ua->get($url);
+            if (!$res->is_success) {
+                warn "Status check failed for $p->{key}: " . $res->content . "\n";
+                push @still, $p;
+                next;
+            }
+            my $dat   = $json->decode($res->content);
+            my $state = $dat->{status}{state} // '';
+            if ($state eq 'running' || $state eq 'submitted') {
+                push @still, $p;
+            } else {
+                printf "  [%-12s] %s/%s TLOG %s deleted\n",
+                    $state, $t->{collection}, $t->{shard}, $t->{tlog_rep_name};
+                # slot freed
+            }
+        }
+    }
+    @pending = @still;
+
+    submit_add() while @queue && @pending < $opt->concurrency;
+
+    if (@pending) {
+        my %counts;
+        $counts{$_->{phase}}++ for @pending;
+        printf "  (%s, %d queued)\n",
+            join(", ", map { "$counts{$_} $_" } sort keys %counts),
+            scalar @queue;
+    }
+}
+
+print "\nDone.\n";

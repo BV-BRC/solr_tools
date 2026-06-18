@@ -1,0 +1,274 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Read the current shard allocation, find all shards hosted on a source
+# hostname, and create one new replica for each such shard on the destination
+# host, distributing evenly across the given destination ports.
+#
+# Destination node names are formed as: desthost:port_solr
+#
+# Usage:
+#   st-replicate-shards --source <src-host> --dest <dst-host> --ports <p1,p2,...>
+#
+
+use strict;
+use POSIX qw(strftime);
+use JSON::XS;
+use Solr;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options(
+    "%c %o",
+    ['source|s=s'  => 'Source hostname (prefix-matched against Solr node_name)',   { required => 1 }],
+    ['dest|d=s'    => 'Destination hostname',                                        { required => 1 }],
+    ['ports|p=s'   => 'Comma-separated list of destination Solr listening ports',    { required => 1 }],
+    ['url=s'       => 'Solr base url', { default => 'https://bio-gp1.cels.anl.gov:15183/solr' }],
+    ['netrc=s'     => 'netrc file for passwords'],
+    ['concurrency|c=i' => 'Max simultaneous ADDREPLICA operations', { default => 2 }],
+    ['dry-run|n'       => 'Print the plan without submitting any requests'],
+    ['help|h'          => 'show this help message'],
+);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 0;
+
+my @dest_ports = split(/,\s*/, $opt->ports);
+die "Must specify at least one destination port\n" unless @dest_ports;
+
+my $creds;
+$creds = { netrc => $opt->netrc } if $opt->netrc;
+
+my($solr, $status) = get_cluster_status_any($opt->url, $creds);
+
+sub get_cluster_status_any {
+    my($primary_url, $creds) = @_;
+    my $solr   = Solr->new($primary_url, $creds);
+    my $status = eval { $solr->get_cluster_status() };
+    return ($solr, $status) unless $@;
+
+    warn "Could not reach $primary_url: $@Trying live local cluster nodes...\n";
+    for my $node (grep { $_->{pid_status} eq 'live' && !$_->{stopped} } Solr->cluster_nodes()) {
+        $solr   = Solr->new($node->{url}, $creds);
+        $status = eval { $solr->get_cluster_status() };
+        unless ($@) {
+            printf "Using node: %s\n", $node->{url};
+            return ($solr, $status);
+        }
+    }
+    die "Could not retrieve cluster status from $primary_url or any live local node\n";
+}
+
+# Resolve destination node names from the cluster's live_nodes list.
+# This handles FQDNs correctly rather than constructing names that may not match.
+my @live_nodes = @{$status->{live_nodes} // []};
+my %port_wanted = map { $_ => 1 } @dest_ports;
+my @dest_nodes;
+for my $node (sort @live_nodes) {
+    if ($node =~ /^\Q${\$opt->dest}\E:(\d+)_solr$/ && $port_wanted{$1}) {
+        push @dest_nodes, $node;
+        delete $port_wanted{$1};
+    }
+}
+if (my @missing = sort keys %port_wanted) {
+    my @candidates = grep { /^\Q${\$opt->dest}\E:/ } @live_nodes;
+    die "Ports not found in cluster live_nodes for '${\$opt->dest}': @missing\n"
+      . "Live nodes matching that host:\n"
+      . (@candidates ? join("", map { "  $_\n" } @candidates) : "  (none)\n");
+}
+my %dest_node_set = map { $_ => 1 } @dest_nodes;
+
+my $src_prefix = $opt->source;
+
+printf "Source host prefix: %s\n", $src_prefix;
+printf "Destination nodes:\n";
+printf "  %s\n", $_ for @dest_nodes;
+print "\n";
+
+# Find unique (collection, shard) pairs that have a replica on the source host.
+# Track how many replicas each destination node already holds so that existing
+# placements seed the load-balancing for remaining work — allowing the script
+# to resume a previously aborted run without skewing the distribution.
+my %dest_count = map { $_ => 0 } @dest_nodes;
+my @tasks;
+for my $col (sort keys %{$status->{collections}}) {
+    my $shards = $status->{collections}{$col}{shards};
+    for my $shard (sort keys %$shards) {
+        my @reps = values %{$shards->{$shard}{replicas}};
+
+        my @src_reps = grep { $_->{node_name} =~ /^\Q$src_prefix\E:/ } @reps;
+        next unless @src_reps;
+
+        my ($existing_dest) = grep { $dest_node_set{$_->{node_name}} } @reps;
+        if ($existing_dest) {
+            my $node = $existing_dest->{node_name};
+            printf "ALREADY PLACED: %s/%s on %s (state: %s, type: %s)\n",
+                $col, $shard, $node, $existing_dest->{state},
+                uc($existing_dest->{type} // '?');
+            $dest_count{$node}++;
+            next;
+        }
+
+        # Determine replica type to create.
+        my $src_type  = uc($src_reps[0]{type} // 'NRT');
+        my $has_nrt   = grep { uc($_->{type} // 'NRT') eq 'NRT' } @reps;
+
+        my ($replica_type, $type_reason);
+        if (!$has_nrt) {
+            $replica_type = 'NRT';
+            $type_reason  = 'no NRT replicas exist for this shard';
+        } elsif ($src_type eq 'NRT') {
+            $replica_type = 'NRT';
+            $type_reason  = 'source replica is NRT';
+        } else {
+            $replica_type = 'TLOG';
+            $type_reason  = "source replica is $src_type";
+        }
+
+        push @tasks, { collection => $col, shard => $shard,
+                       replica_type => $replica_type, type_reason => $type_reason };
+    }
+}
+
+if (!@tasks) {
+    print "No remaining shards to replicate — all already placed on destination.\n";
+    exit 0;
+}
+
+# Assign each task to whichever destination node currently has the fewest
+# replicas (already-placed ones included), breaking ties by node order.
+for my $t (@tasks) {
+    my ($lightest) = sort { $dest_count{$a} <=> $dest_count{$b} || $a cmp $b } @dest_nodes;
+    $t->{dest_node} = $lightest;
+    $dest_count{$lightest}++;
+}
+
+printf "Plan: %d replica(s) to create\n\n", scalar @tasks;
+printf "  %-40s  %-5s  %-40s  %s\n", "COLLECTION/SHARD", "TYPE", "DEST NODE", "REASON";
+for my $t (@tasks) {
+    printf "  %-40s  %-5s  %-40s  %s\n",
+        "$t->{collection}/$t->{shard}", $t->{replica_type},
+        $t->{dest_node}, $t->{type_reason};
+}
+print "\n";
+
+exit 0 if $opt->dry_run;
+
+my $concurrency = $opt->concurrency;
+printf "Concurrency: %d\n\n", $concurrency;
+
+my $ts      = strftime("%Y%m%d-%H%M%S", localtime);
+my $seq     = 0;
+# Each entry in @pending is a task in one of two sub-states:
+#   async_pending - ADDREPLICA submitted, polling REQUESTSTATUS
+#   recovering    - async key completed, replica exists but not yet active
+#
+# A concurrency slot is held until the replica reaches 'active', so the
+# --concurrency limit truly caps simultaneous index recoveries.
+
+my @queue   = @tasks;
+my @pending = ();
+
+sub submit_next {
+    my $t   = shift @queue;
+    my $key = "repl-$ts-" . $seq++;
+
+    my $url = $opt->url
+            . "/admin/collections?action=ADDREPLICA"
+            . "&collection=$t->{collection}"
+            . "&shard=$t->{shard}"
+            . "&type=$t->{replica_type}"
+            . "&node=$t->{dest_node}"
+            . "&async=$key";
+
+    printf "Submitting (%d queued) %s/%s [%s] -> %s ... ",
+        scalar @queue, $t->{collection}, $t->{shard},
+        $t->{replica_type}, $t->{dest_node};
+    my $res = $solr->ua->get($url);
+    if (!$res->is_success) {
+        printf "HTTP %s FAILED\n", $res->code;
+        warn $res->content . "\n";
+        return;
+    }
+    my $dat = $json->decode($res->content);
+    if ($dat->{responseHeader}{status} != 0) {
+        print "FAILED\n";
+        warn $json->encode($dat) . "\n";
+        return;
+    }
+    print "ok (key=$key)\n";
+    push @pending, { phase => 'async', key => $key, task => $t };
+}
+
+sub check_replica_active {
+    my($cs, $t) = @_;
+    my $replicas = $cs->{collections}{$t->{collection}}{shards}{$t->{shard}}{replicas} // {};
+    my ($rep) = grep { $_->{node_name} eq $t->{dest_node} } values %$replicas;
+    return $rep ? $rep->{state} : 'missing';
+}
+
+# Seed the initial batch
+submit_next() while @queue && @pending < $concurrency;
+
+while (@pending) {
+    sleep 10;
+
+    # Fetch cluster status once per cycle for all recovering replicas
+    my $need_cs = grep { $_->{phase} eq 'recovering' } @pending;
+    my $cs = $need_cs ? $solr->get_cluster_status() : undef;
+
+    my @still;
+    for my $p (@pending) {
+        my $t = $p->{task};
+
+        if ($p->{phase} eq 'async') {
+            my $url = $opt->url . "/admin/collections?action=REQUESTSTATUS&requestid=$p->{key}";
+            my $res = $solr->ua->get($url);
+            if (!$res->is_success) {
+                warn "Status check failed for $p->{key}: " . $res->content . "\n";
+                push @still, $p;
+                next;
+            }
+            my $dat   = $json->decode($res->content);
+            my $state = $dat->{status}{state} // '';
+            if ($state eq 'running' || $state eq 'submitted') {
+                push @still, $p;
+            } elsif ($state eq 'completed') {
+                printf "  [created     ] %s/%s -> %s (recovering)\n",
+                    $t->{collection}, $t->{shard}, $t->{dest_node};
+                $p->{phase} = 'recovering';
+                push @still, $p;
+                # Fetch CS now if we didn't already
+                $cs //= $solr->get_cluster_status();
+            } else {
+                printf "  [%-12s] %s/%s -> %s\n",
+                    $state, $t->{collection}, $t->{shard}, $t->{dest_node};
+                # slot freed — don't push to @still
+            }
+
+        } elsif ($p->{phase} eq 'recovering') {
+            my $state = check_replica_active($cs, $t);
+            if ($state eq 'active') {
+                printf "  [active      ] %s/%s on %s\n",
+                    $t->{collection}, $t->{shard}, $t->{dest_node};
+                # slot freed — don't push to @still
+            } else {
+                push @still, $p;
+            }
+        }
+    }
+    @pending = @still;
+
+    # Fill freed slots
+    submit_next() while @queue && @pending < $concurrency;
+
+    if (@pending) {
+        my $async_n     = scalar grep { $_->{phase} eq 'async'      } @pending;
+        my $recovering_n = scalar grep { $_->{phase} eq 'recovering' } @pending;
+        printf "  (%d async, %d recovering, %d queued)\n",
+            $async_n, $recovering_n, scalar @queue;
+    }
+}
+
+print "\nDone.\n";

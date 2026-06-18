@@ -1,0 +1,194 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Remove all replicas hosted on a given node (prefix-matched against node_name).
+#
+# Refuses to delete a replica unless at least 2 other active replicas of that
+# shard exist elsewhere. Use --force to override (dangerous — data loss risk).
+#
+# Usage:
+#   st-drain-node --node <hostname> [options]
+#
+
+use strict;
+use POSIX qw(strftime);
+use JSON::XS;
+use Solr;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options(
+    "%c %o",
+    ['node|n=s'        => 'Node hostname to drain (prefix-matched against node_name)', { required => 1 }],
+    ['url=s'           => 'Solr base url', { default => 'https://bio-gp1.cels.anl.gov:15183/solr' }],
+    ['netrc=s'         => 'netrc file for passwords'],
+    ['concurrency|c=i' => 'Max simultaneous DELETEREPLICA operations', { default => 2 }],
+    ['force'           => 'Remove replicas even if fewer than 2 other active copies exist'],
+    ['verbose|v'       => 'List the other replicas for each shard in the plan'],
+    ['dry-run'         => 'Print the plan without submitting any requests'],
+    ['help|h'          => 'show this help message'],
+);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 0;
+
+my $creds;
+$creds = { netrc => $opt->netrc } if $opt->netrc;
+
+my($solr, $status) = get_cluster_status_any($opt->url, $creds);
+
+sub get_cluster_status_any {
+    my($primary_url, $creds) = @_;
+    my $solr   = Solr->new($primary_url, $creds);
+    my $status = eval { $solr->get_cluster_status() };
+    return ($solr, $status) unless $@;
+
+    warn "Could not reach $primary_url: $@Trying live local cluster nodes...\n";
+    for my $node (grep { $_->{pid_status} eq 'live' && !$_->{stopped} } Solr->cluster_nodes()) {
+        $solr   = Solr->new($node->{url}, $creds);
+        $status = eval { $solr->get_cluster_status() };
+        unless ($@) {
+            printf "Using node: %s\n", $node->{url};
+            return ($solr, $status);
+        }
+    }
+    die "Could not retrieve cluster status from $primary_url or any live local node\n";
+}
+
+my $node_prefix = $opt->node;
+printf "Node to drain: %s\n\n", $node_prefix;
+
+# Find all replicas on the target node, checking safety of removal.
+my @tasks;
+my @refused;
+for my $col (sort keys %{$status->{collections}}) {
+    my $shards = $status->{collections}{$col}{shards};
+    for my $shard (sort keys %$shards) {
+        my %replicas = %{$shards->{$shard}{replicas}};
+
+        my @on_node  = grep { $replicas{$_}{node_name} =~ /^\Q$node_prefix\E:/ } keys %replicas;
+        next unless @on_node;
+
+        my @others = grep { $replicas{$_}{node_name} !~ /^\Q$node_prefix\E:/ } keys %replicas;
+        my @active_others = grep { $replicas{$_}{state} eq 'active' } @others;
+        my @other_info = sort { $a->{node_name} cmp $b->{node_name} }
+                         map  { $replicas{$_} } @others;
+
+        for my $rep_name (@on_node) {
+            if (@active_others < 2 && !$opt->force) {
+                push @refused, { collection => $col, shard => $shard,
+                                 replica    => $rep_name,
+                                 reason     => "only " . scalar(@active_others) . " other active replica(s)",
+                                 others     => \@other_info };
+            } else {
+                push @tasks, { collection => $col, shard => $shard,
+                               replica    => $rep_name,
+                               node       => $replicas{$rep_name}{node_name},
+                               others     => \@other_info };
+            }
+        }
+    }
+}
+
+if (@refused) {
+    print "REFUSED (fewer than 2 other active replicas exist — use --force to override):\n";
+    for my $r (@refused) {
+        printf "  %s/%s  replica=%s  (%s)\n",
+            $r->{collection}, $r->{shard}, $r->{replica}, $r->{reason};
+        if ($opt->verbose) {
+            printf "    %-15s  %s\n", $_->{state}, $_->{node_name} for @{$r->{others}};
+        }
+    }
+    print "\n";
+}
+
+if (!@tasks) {
+    print "No replicas to remove.\n";
+    exit(@refused ? 1 : 0);
+}
+
+printf "Plan: %d replica(s) to remove\n\n", scalar @tasks;
+printf "  %-35s  %-15s  %s\n", "COLLECTION/SHARD", "REPLICA", "NODE";
+for my $t (@tasks) {
+    printf "  %-35s  %-15s  %s\n",
+        "$t->{collection}/$t->{shard}", $t->{replica}, $t->{node};
+    if ($opt->verbose) {
+        printf "    %-15s  %s\n", $_->{state}, $_->{node_name} for @{$t->{others}};
+    }
+}
+print "\n";
+
+exit 0 if $opt->dry_run;
+
+# Submit DELETEREPLICA requests asynchronously, concurrency-limited.
+# Unlike ADDREPLICA, deletion does not involve index recovery, so the async
+# key completing means the replica is actually gone — one polling phase suffices.
+my $ts      = strftime("%Y%m%d-%H%M%S", localtime);
+my $seq     = 0;
+my @queue   = @tasks;
+my @pending = ();
+
+printf "Concurrency: %d\n\n", $opt->concurrency;
+
+sub submit_next {
+    my $t   = shift @queue;
+    my $key = "drain-$ts-" . $seq++;
+
+    my $url = $opt->url
+            . "/admin/collections?action=DELETEREPLICA"
+            . "&collection=$t->{collection}"
+            . "&shard=$t->{shard}"
+            . "&replica=$t->{replica}"
+            . "&async=$key";
+
+    printf "Submitting (%d queued) %s/%s %s ... ",
+        scalar @queue, $t->{collection}, $t->{shard}, $t->{replica};
+    my $res = $solr->ua->get($url);
+    if (!$res->is_success) {
+        printf "HTTP %s FAILED\n", $res->code;
+        warn $res->content . "\n";
+        return;
+    }
+    my $dat = $json->decode($res->content);
+    if ($dat->{responseHeader}{status} != 0) {
+        print "FAILED\n";
+        warn $json->encode($dat) . "\n";
+        return;
+    }
+    print "ok (key=$key)\n";
+    push @pending, { key => $key, task => $t };
+}
+
+submit_next() while @queue && @pending < $opt->concurrency;
+
+while (@pending) {
+    sleep 5;
+    my @still;
+    for my $p (@pending) {
+        my $url = $opt->url . "/admin/collections?action=REQUESTSTATUS&requestid=$p->{key}";
+        my $res = $solr->ua->get($url);
+        if (!$res->is_success) {
+            warn "Status check failed for $p->{key}: " . $res->content . "\n";
+            push @still, $p;
+            next;
+        }
+        my $dat   = $json->decode($res->content);
+        my $state = $dat->{status}{state} // '';
+        if ($state eq 'running' || $state eq 'submitted') {
+            push @still, $p;
+        } else {
+            my $t = $p->{task};
+            printf "  [%-12s] %s/%s %s\n",
+                $state, $t->{collection}, $t->{shard}, $t->{replica};
+        }
+    }
+    @pending = @still;
+
+    submit_next() while @queue && @pending < $opt->concurrency;
+
+    printf "  (%d running, %d queued)\n", scalar @pending, scalar @queue
+        if @pending;
+}
+
+print "\nDone.\n";

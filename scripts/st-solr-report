@@ -1,0 +1,45 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Roll up status into a report
+#
+#
+
+use POSIX;
+use strict;
+use File::Slurp;
+use JSON::XS;
+use Solr;
+use Data::Dumper;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options("%c %o dir aggr-out",
+				    ['help|h' => 'show this help message']);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 2;
+
+my $dir = shift;
+my $aggr_out = shift;;
+
+my %stats;
+
+my @all_data;
+for my $f (<$dir/*>)
+{
+    my $dat = $json->decode(scalar read_file($f));
+    $stats{mem} += $dat->{memory}->{total};
+    for my $disk (grep { $_->{mount} =~ /data/ } @{$dat->{filesystems}})
+    {
+	$stats{disk_used} += $disk->{used};
+	$stats{disk_total} += $disk->{total};
+    }
+    $stats{mem} += $dat->{memory}->{total};
+    $stats{threads} += $dat->{cpu}->{threads};
+    push(@all_data, $dat);
+}
+write_file($aggr_out, $json->encode(\@all_data));
+$stats{disk_pct} = int(100 * $stats{disk_used} / $stats{disk_total});
+print Dumper(\%stats);

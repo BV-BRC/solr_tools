@@ -1,0 +1,80 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Solr node monitor
+#
+#
+
+use POSIX;
+use strict;
+use JSON::XS;
+use Solr;
+use Data::Dumper;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my $hostname = `hostname -f`;
+chomp $hostname;
+
+my($opt, $usage) = describe_options("%c %o",
+				    ['netrc=s' => "netrc file for passwords"],
+				    ['help|h' => 'show this help message']);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 0;
+
+my $creds;
+if ($opt->netrc) {
+    $creds = {netrc => $opt->netrc };
+}
+
+#
+# We scan all cluster node folders looking for PORT-XXXXX files that define
+# the listening ports.
+#
+# A node folder is disregarded if it contains a file STOPPED which is written
+# when the stop.sh script is executed.
+#
+
+my @nodes = Solr->cluster_nodes();
+
+my @ok_nodes;
+
+for my $node (@nodes)
+{
+    my $solr = Solr->new($node->{url}, $creds);
+    my $res = $solr->ping("genome");
+    print "$node->{port} status: $res\n";
+    push(@ok_nodes, $node) if $res eq 'OK';
+}
+
+#
+# Pick an OK node to pull cluster status
+#
+
+if (@ok_nodes == 0)
+{
+    die "No live nodes on $hostname\n";
+}
+
+my $node = $ok_nodes[0];
+my $solr = Solr->new($node->{url}, $creds);
+
+my $status = $solr->cluster_status();
+for my $node (@nodes)
+{
+    my $shards = $solr->get_shards_for_node($node->{url});
+    for my $info (@$shards)
+    {
+	my($col, $shard, $health, $rep) = @$info;
+	print "$col $shard $health:\n";
+	while (my($orep, $orepdata) = each %{$status->{collections}->{$col}->{shards}->{$shard}->{replicas}})
+	{
+	    print $json->encode($orepdata);
+	}
+    }
+    exit;
+}
+
+

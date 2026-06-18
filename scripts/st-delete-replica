@@ -1,0 +1,101 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Delete a replica from a collection on a given node
+#
+
+use POSIX;
+use strict;
+use JSON::XS;
+use Solr;
+use Data::Dumper;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options("%c %o collection node",
+				    ['url=s' => 'Solr base url', { default => "https://walnut.cels.anl.gov:15183/solr" }],
+				    ['netrc=s' => "netrc file for passwords"],
+				    ['help|h' => 'show this help message']);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 2 && @ARGV != 1;
+
+
+my $collection = shift;
+my $node = shift;
+
+my $replica_type = 'tlog';
+
+my $creds;
+if ($opt->netrc) {
+    $creds = {netrc => $opt->netrc };
+}
+my $solr = Solr->new($opt->url, $creds);
+
+my $status = $solr->cluster_status($collection)->{collections}->{$collection};
+if (!$status)
+{
+    die "Status for collection $collection not found\n";
+}
+		     
+my $shards = $status->{shards};
+
+#
+# Find the shard for the collection that is on the given node
+#
+
+my @cand;
+while (my ($shard_name, $shard) = each %$shards)
+{
+    while (my($rep_name, $rep) = each (%{$shard->{replicas}}))
+    {
+	if ($rep->{node_name} eq $node)
+	{
+	    push @cand, [$shard_name, $rep_name, $rep];
+	}
+    }
+}
+if (@cand == 0)
+{
+    die "No candidate replicas found to remove\n";
+}
+elsif (@cand > 1)
+{
+    die "No unique candidate replicas found to remove\n";
+}
+my ($shard_name, $rep_name, $rep) = @{$cand[0]};
+print "Remove $shard_name $rep_name\n";
+
+my $key = "st-delete-replica-$collection-" . strftime("%Y-%m-%d-%H-%M-%S", localtime);
+my $url = $opt->url . "/admin/collections?action=DELETEREPLICA&collection=$collection&shard=$shard_name&replica=$rep_name&async=$key";
+
+print "Request: $url\n";
+my $res = $solr->ua->get($url);
+if (!$res->is_success)
+{
+    die "deletereplica request failed: " . $res->content;
+}
+
+
+my $dat = decode_json($res->content);
+print "Initial result:\n" . $json->encode($dat);
+
+while (1)
+{
+    my $url = $opt->url . "/admin/collections?action=REQUESTSTATUS&requestid=$key";
+    my $res = $solr->ua->get($url);
+    if (!$res->is_success)
+    {
+	die "Status request for $key failed: " . $res->content;
+    }
+    my $dat = decode_json($res->content);
+
+    if ($dat->{status}->{state} ne 'running' && $dat->{status}->{state} ne 'submitted')
+    {
+	print "Task complete with status $dat->{status}->{state}:\n" . $json->encode($dat);
+	exit;
+    }
+    print "Task running...\n";
+    sleep 3;
+}

@@ -1,0 +1,102 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Move the follower replica of the given collection to another node.
+#
+# Use st-add-replica followed by st-delete-replica
+#
+# Fails if collection is not replicated, or if it has more than one shard.
+#
+
+use strict;
+use Solr;
+use Data::Dumper;
+use Getopt::Long::Descriptive;
+
+my($opt, $usage) = describe_options("%c %o collection [destination]",
+				    ['shard=s' => "Specfiy shard name for sharded collection"],
+				    ['url=s' => 'Solr base url', { default => "https://walnut.cels.anl.gov:15183/solr" }],
+				    ['netrc=s' => "netrc file for passwords"],
+				    ['help|h' => 'show this help message']);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 2 && @ARGV != 1;
+
+
+my $collection = shift;
+my $dest = shift;
+
+my $creds;
+if ($opt->netrc) {
+    $creds = {netrc => $opt->netrc };
+}
+my $solr = Solr->new($opt->url, $creds);
+
+my $status = $solr->cluster_status($collection)->{collections}->{$collection};;
+if (!$status)
+{
+    die "Status for collection $collection not found\n";
+}
+		     
+my $shards = $status->{shards};
+my @shard_names = keys %$shards;
+my $n_shards = @shard_names;
+
+my $shard_name;
+if ($opt->shard)
+{
+    $shard_name = $opt->shard;
+    if (!exists $shards->{$shard_name})
+    {
+	die "Shard $shard_name does not exist (@shard_names)\n";
+    }
+}
+else
+{
+    my $n_shards = @shard_names;
+    $n_shards == 1 or die "Collection $collection has more than one shard ($n_shards)\n";
+
+    $shard_name = $shard_names[0];
+}
+
+my $replicas = $shards->{$shard_name}->{replicas};
+my @followers = grep { $_->{leader} ne 'true' } values %$replicas;
+
+if (@followers != 1)
+{
+    die "Must have one follower (not " . scalar @followers . ")";
+}
+
+my $follower = $followers[0];
+
+my $to_remove = $follower->{node_name};
+
+my $script = $0;
+$script =~ s/st-move-follower/st-add-replica/;
+-x $script or die "Can't find $script\n";
+
+my @auth;
+@auth = ("--netrc", $opt->netrc) if $opt->netrc;
+my @cmd = ($script, @auth, "--shard", $shard_name, $collection, $dest);
+print "Run @cmd\n";
+my $rc = system(@cmd);
+
+if ($rc != 0)
+{
+    die "Error $rc adding replica\n";
+}
+
+print "Remove from $to_remove\n";
+
+$script = $0;
+$script =~ s/st-move-follower/st-delete-replica/;
+-x $script or die "Can't find $script\n";
+
+@cmd = ($script, @auth, $collection, $to_remove);
+$rc = system(@cmd);
+
+if ($rc != 0)
+{
+    die "Error $rc removing replica with @cmd\n";
+}
+    

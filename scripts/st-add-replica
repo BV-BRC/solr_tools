@@ -1,0 +1,106 @@
+#!/vol/patric3/cli/ubuntu-runtime/bin/perl
+use lib '/home/olson/BV-BRC/solr_tools/lib';
+
+#
+# Add a replicate to an existing collection. Takes an optional target.
+# If no target given, should use the affinity placement engine to find a good place,
+# hopefully on the "other" availability zone.
+#
+
+use POSIX;
+use strict;
+use JSON::XS;
+use Solr;
+use Data::Dumper;
+use Getopt::Long::Descriptive;
+
+my $json = JSON::XS->new->pretty->canonical;
+
+my($opt, $usage) = describe_options("%c %o collection [destination]",
+				    ['shard=s' => "Specfiy shard name for sharded collection"],
+				    ['url=s' => 'Solr base url', { default => "https://walnut.cels.anl.gov:15183/solr" }],
+				    ['netrc=s' => "netrc file for passwords"],
+				    ['help|h' => 'show this help message']);
+print($usage->text), exit 0 if $opt->help;
+die($usage->text) if @ARGV != 2 && @ARGV != 1;
+
+
+my $collection = shift;
+my $dest = shift;
+
+my $replica_type = 'tlog';
+
+my $creds;
+if ($opt->netrc) {
+    $creds = {netrc => $opt->netrc };
+}
+my $solr = Solr->new($opt->url, $creds);
+
+my $status = $solr->cluster_status($collection)->{collections}->{$collection};;
+if (!$status)
+{
+    die "Status for collection $collection not found\n";
+}
+		     
+my $shards = $status->{shards};
+my @shard_names = keys %$shards;
+
+my $shard_name;
+if ($opt->shard)
+{
+    $shard_name = $opt->shard;
+    if (!exists $shards->{$shard_name})
+    {
+	die "Shard $shard_name does not exist (@shard_names)\n";
+    }
+}
+else
+{
+    my $n_shards = @shard_names;
+    $n_shards == 1 or die "Collection $collection has more than one shard ($n_shards)\n";
+
+    $shard_name = $shard_names[0];
+}
+
+my $replicas = $shards->{$shard_name}->{replicas};
+
+my @replicas = values %$replicas;
+if (@replicas > 1)
+{
+    warn "$collection already has multiple replicas\n";
+}
+
+my $dest_node = $dest ? "&node=$dest" : "";
+
+my $key = 'st-add-replica-$collection-' . strftime("%Y-%m-%d-%H-%M-%S", localtime);
+my $url = $opt->url . "/admin/collections?action=ADDREPLICA&collection=$collection&shard=$shard_name&type=$replica_type&async=$key$dest_node";
+
+print "Request: $url\n";
+my $res = $solr->ua->get($url);
+if (!$res->is_success)
+{
+    die "addreplica request failed: " . $res->content;
+}
+
+
+my $dat = decode_json($res->content);
+print "Initial result:\n" . $json->encode($dat);
+
+while (1)
+{
+    my $url = $opt->url . "/admin/collections?action=REQUESTSTATUS&requestid=$key";
+    my $res = $solr->ua->get($url);
+    if (!$res->is_success)
+    {
+	die "Status request for $key failed: " . $res->content;
+    }
+    my $dat = decode_json($res->content);
+
+    if ($dat->{status}->{state} ne 'running' && $dat->{status}->{state} ne 'submitted')
+    {
+	print "Task complete with status $dat->{status}->{state}:\n" . $json->encode($dat);
+	exit;
+    }
+    print "Task running...\n";
+    sleep 3;
+}
